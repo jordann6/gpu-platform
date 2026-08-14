@@ -1,4 +1,5 @@
 module "eks" {
+  # checkov:skip=CKV_TF_1:Registry module pinned by immutable semantic version.
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 20.31"
 

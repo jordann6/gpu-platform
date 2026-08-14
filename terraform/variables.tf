@@ -79,6 +79,12 @@ variable "reaper_idle_minutes" {
   default     = 30
 }
 
+variable "collector_heartbeat_timeout" {
+  description = "Seconds of heartbeat staleness before the collector is judged wedged."
+  type        = number
+  default     = 300
+}
+
 variable "reaper_dry_run" {
   description = <<-EOT
     When true the reaper logs and records what it would terminate without

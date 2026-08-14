@@ -6,6 +6,10 @@ PY := finops/.venv/bin/python
 ACCOUNT := $(shell aws sts get-caller-identity --query Account --output text)
 ECR := $(ACCOUNT).dkr.ecr.$(REGION).amazonaws.com
 IMAGE := $(ECR)/gpu-platform-dev/finops-collector
+# Immutable tag. The ECR repository rejects re-pushes, so a tag names exactly
+# one build and a rollback is unambiguous.
+TAG := $(shell git rev-parse --short HEAD)
+GUARDRAILS := $(HOME)/platform-guardrails
 
 .PHONY: help venv test lint image deploy kubeconfig demo status costs destroy clean
 
@@ -20,24 +24,29 @@ test: ## Run collector unit tests and terraform validation
 	cd finops && .venv/bin/python -m pytest tests/ -q
 	$(TF) fmt -check -recursive
 	$(TF) validate
+	conftest test --parser hcl2 --combine --policy $(GUARDRAILS)/policy terraform/*.tf
+	checkov -d terraform --framework terraform --compact --quiet
 
 lint: ## Lint python
 	cd finops && .venv/bin/ruff check collector tests
 
-image: ## Build and push the collector image
+image: ## Build and push the collector image, tagged with the git SHA
+	@git diff --quiet || { echo "working tree is dirty; commit before building so the tag names this code"; exit 1; }
 	aws ecr get-login-password --region $(REGION) \
 		| docker login --username AWS --password-stdin $(ECR)
-	docker build --platform linux/amd64 -t $(IMAGE):latest finops/
-	docker push $(IMAGE):latest
+	docker build --platform linux/amd64 -t $(IMAGE):$(TAG) finops/
+	docker push $(IMAGE):$(TAG)
 
 # The collector deployment references an image that has to exist before the
 # deployment applies, and the ECR repository has to exist before the image can
 # be pushed. So the ECR resource applies alone first.
 deploy: ## Full deploy (ECR, image, then everything else)
 	$(TF) init -input=false
-	$(TF) apply -input=false -auto-approve -target=aws_ecr_repository.collector
+	# -target does not exempt a variable from being required, so the tag has to
+	# be passed here too even though nothing in this stage consumes it.
+	$(TF) apply -input=false -auto-approve -var collector_image_tag=$(TAG) -target=aws_ecr_repository.collector
 	$(MAKE) image
-	$(TF) apply -input=false -auto-approve
+	$(TF) apply -input=false -auto-approve -var collector_image_tag=$(TAG)
 	$(MAKE) kubeconfig
 
 kubeconfig: ## Point kubectl at the cluster

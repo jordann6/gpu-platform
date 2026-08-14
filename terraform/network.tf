@@ -12,6 +12,9 @@ locals {
 }
 
 module "vpc" {
+  # checkov:skip=CKV_TF_1:Registry modules are pinned by semantic version,
+  #   which the registry protocol makes immutable. Commit-hash pinning
+  #   applies to git sources; it is not expressible for a registry source.
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.13"
 

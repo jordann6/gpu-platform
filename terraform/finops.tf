@@ -2,6 +2,15 @@
 # dashboard's table would couple two repos through state and make the
 # guardrails destroy-guard unable to tell a demo teardown from data loss.
 resource "aws_dynamodb_table" "gpu_costs" {
+  # checkov:skip=CKV_AWS_28:Point-in-time recovery is off deliberately. Every
+  #   record carries a 14-day TTL and is demo evidence regenerated on each
+  #   run, not a system of record. PITR would bill continuously for data that
+  #   is designed to expire.
+  # checkov:skip=CKV_AWS_119:A customer-managed CMK is declined on teardown
+  #   cost, not on principle. KMS keys cannot be deleted immediately; they
+  #   linger 7 to 30 days after destroy, which is exactly the residue the
+  #   landing-zone teardown had to account for. AWS-owned encryption covers
+  #   TTL'd demo data.
   name         = "${local.name}-costs"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "pk"
@@ -32,12 +41,24 @@ resource "aws_dynamodb_table" "gpu_costs" {
 }
 
 resource "aws_ecr_repository" "collector" {
-  name                 = "${local.name}/finops-collector"
-  image_tag_mutability = "MUTABLE"
-  force_delete         = true
+  name = "${local.name}/finops-collector"
+
+  # Immutable. Images are tagged with the git SHA, so a tag names exactly one
+  # build forever and a rollback is unambiguous. This also makes a re-push of
+  # the same tag fail loudly rather than silently changing what is deployed.
+  image_tag_mutability = "IMMUTABLE"
+
+  # Demo repository; the teardown should not need a manual image purge first.
+  force_delete = true
 
   image_scanning_configuration {
     scan_on_push = true
+  }
+
+  encryption_configuration {
+    # AWS-managed ECR key. Same reasoning as the DynamoDB table: a CMK would
+    # outlive the destroy by 7 to 30 days for no benefit on public images.
+    encryption_type = "KMS"
   }
 }
 

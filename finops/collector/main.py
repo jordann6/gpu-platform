@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .config import Config
 from .pricing import Pricing, interval_cost, wasted_cost
@@ -22,11 +24,21 @@ log = logging.getLogger("finops.collector")
 
 _running = True
 
+# The container runs with a read-only root filesystem, so /tmp is the only
+# writable path. Touched at the end of every completed tick, which makes it a
+# real liveness signal: a loop wedged on a hung API call stops touching it
+# while the process stays alive, and a plain process check would miss that.
+HEARTBEAT = Path(os.environ.get("HEARTBEAT_PATH", "/tmp/collector-heartbeat"))
+
 
 def _stop(signum, _frame):
     global _running
     log.info("received signal %s, shutting down", signum)
     _running = False
+
+
+def touch_heartbeat() -> None:
+    HEARTBEAT.write_text(str(int(time.time())))
 
 
 def tick(cfg: Config, prom: Prometheus, pricing: Pricing, store: CostStore, reaper: Reaper) -> None:
@@ -125,6 +137,10 @@ def main() -> int:
     store = CostStore(cfg.table_name, cfg.region)
     reaper = Reaper(samples_required=cfg.samples_required, dry_run=cfg.dry_run)
 
+    # Marks the process ready before the first tick, which can legitimately
+    # take a full interval when no GPU node exists yet.
+    touch_heartbeat()
+
     while _running:
         started = time.monotonic()
         try:
@@ -132,6 +148,11 @@ def main() -> int:
         except Exception:
             # One bad scrape must not take down cost collection for the fleet.
             log.exception("tick failed")
+
+        # Touched after the tick completes, including a tick that caught an
+        # exception: the loop is healthy, the dependency is not, and killing
+        # the pod would not fix Prometheus.
+        touch_heartbeat()
 
         elapsed = time.monotonic() - started
         time.sleep(max(0.0, cfg.interval_seconds - elapsed))

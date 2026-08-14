@@ -13,3 +13,16 @@ __pycache__/
 .ruff_cache/
 
 .DS_Store
+
+# --- platform-guardrails ---
+!example.tfvars
+tfplan
+plan.json
+.env
+.envrc
+kubeconfig
+*.kubeconfig
+*.pem
+*.ppk
+.checkov.json
+infracost.json

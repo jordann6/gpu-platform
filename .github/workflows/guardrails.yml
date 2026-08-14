@@ -1,0 +1,25 @@
+name: Guardrails
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Credential-free by design. Everything below runs static analysis over
+# Terraform that, on a pull_request event, was authored by whoever opened the
+# PR. Nothing here should ever hold a permission that can mint a cloud token.
+#
+# The credentialed gates (plan, destroy guard, cost diff) live in tf-plan.yml
+# and are deliberately not wired up here, because they need an OIDC role ARN
+# that this installer has no way to know. See "The credentialed half" in the
+# platform-guardrails README for the block to paste in once you have a role.
+permissions:
+  contents: read
+
+jobs:
+  static:
+    uses: jordann6/platform-guardrails/.github/workflows/tf-ci.yml@v1
+    with:
+      terraform_dir: terraform
+      # Set once the repo has a baseline committed:
+      # checkov_baseline: .checkov.baseline

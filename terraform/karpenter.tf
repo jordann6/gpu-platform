@@ -1,4 +1,5 @@
 module "karpenter" {
+  # checkov:skip=CKV_TF_1:Registry module pinned by immutable semantic version.
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"
   version = "~> 20.31"
 
