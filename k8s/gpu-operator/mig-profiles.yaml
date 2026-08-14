@@ -1,0 +1,71 @@
+# MIG configuration: documented, not deployed.
+#
+# WHY THIS IS NOT RUNNING
+#
+# Multi-Instance GPU partitions a physical card into hardware-isolated slices,
+# each with its own SMs, L2 cache slice, and memory controllers. Unlike
+# time-slicing it is real isolation: a slice cannot OOM or stall its
+# neighbours, because the partition is enforced in silicon rather than by
+# context switching.
+#
+# That silicon only exists on A100, H100, H200, B200, and A30. This project
+# runs on T4 (g4dn) and A10G (g5), and NEITHER supports MIG. It is not a
+# driver flag or a licensing tier, the partitioning hardware is absent.
+#
+# The cheapest MIG-capable instance on EC2 is p4d.24xlarge at roughly $32/hour
+# with its own hard quota gate, which is about 100x this project's entire
+# deploy-demo-destroy budget. So the density comparison in the README measures
+# dedicated versus time-sliced, both of which T4 supports and both of which
+# produced real numbers, and MIG is described honestly as the option that was
+# priced and declined.
+#
+# TO ACTUALLY RUN THIS
+#
+#   1. Add p4d or p5 to var.gpu_instance_families and raise the P-family
+#      service quota (L-417A185B), which is a separate request from the G/VT
+#      one this project already needs.
+#   2. Set migManager.enabled = true in the gpu_operator helm values.
+#   3. Apply this ConfigMap and label nodes with the profile to apply:
+#        kubectl label node <node> nvidia.com/mig.config=all-1g.10gb --overwrite
+#
+# The MIG manager then drains the node, reconfigures the partitions, and the
+# device plugin re-advertises the slices as separate schedulable resources.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mig-parted-config
+  namespace: gpu-operator
+data:
+  config.yaml: |
+    version: v1
+    mig-configs:
+      # Whole card, no partitioning. The baseline any comparison starts from.
+      all-disabled:
+        - devices: all
+          mig-enabled: false
+
+      # Maximum tenancy: seven isolated slices per A100-80GB, each 1/7th of
+      # the SMs with 10GB. The right shape for many small inference replicas.
+      all-1g.10gb:
+        - devices: all
+          mig-enabled: true
+          mig-devices:
+            "1g.10gb": 7
+
+      # Three slices at 2/7ths compute and 20GB. Fits mid-size models that
+      # will not fit in a 1g slice.
+      all-2g.20gb:
+        - devices: all
+          mig-enabled: true
+          mig-devices:
+            "2g.20gb": 3
+
+      # Mixed: one large slice for a training job alongside three small ones
+      # for inference. This is the layout that actually justifies MIG over
+      # simply buying smaller cards.
+      mixed-3g-1g:
+        - devices: all
+          mig-enabled: true
+          mig-devices:
+            "3g.40gb": 1
+            "1g.10gb": 3

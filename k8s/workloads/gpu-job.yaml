@@ -1,0 +1,44 @@
+# A single admitted GPU job. Submitted to Kueue via the queue-name label,
+# never scheduled directly: without that label Kueue does not manage it and it
+# bypasses quota entirely.
+#
+# Load comes from dcgmproftester, which is NVIDIA's own SM load generator.
+# A trivial CUDA sample would finish in milliseconds and never register on a
+# 15s scrape, which would make the utilization story unprovable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-job
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: gpu
+    kueue.x-k8s.io/priority-class: low-priority
+spec:
+  # Kueue suspends and admits; it must not race with the Job controller.
+  suspend: true
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: burn
+          image: nvcr.io/nvidia/cloud-native/dcgm:3.3.9-1-ubuntu22.04
+          command: ["/usr/bin/dcgmproftester12"]
+          # -t 1004 drives fp16 tensor activity, which is what moves
+          # DCGM_FI_PROF_SM_ACTIVE rather than just DCGM_FI_DEV_GPU_UTIL.
+          args: ["--no-dcgm-validation", "-t", "1004", "-d", "300"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          securityContext:
+            capabilities:
+              # Profiling counters are privileged. Without SYS_ADMIN the
+              # tester starts and then reports no profiling support.
+              add: ["SYS_ADMIN"]

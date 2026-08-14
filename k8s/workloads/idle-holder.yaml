@@ -1,0 +1,30 @@
+# The reaper's target: a pod that holds a GPU allocation and does nothing with
+# it. This is the single most common form of GPU waste in real clusters, an
+# interactive notebook session someone opened and walked away from, and it is
+# invisible to every cost tool that reports at instance granularity because
+# the instance looks perfectly busy from the outside.
+#
+# Deliberately NOT submitted through Kueue. An admitted Kueue workload is one
+# of the reaper's four safety holds, so routing this through the queue would
+# make it unreapable by design.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: idle-holder
+  namespace: team-b
+  labels:
+    app: idle-holder
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: idle
+      image: nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+      command: ["sleep", "7200"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
