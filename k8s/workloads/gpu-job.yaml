@@ -2,9 +2,18 @@
 # never scheduled directly: without that label Kueue does not manage it and it
 # bypasses quota entirely.
 #
-# Load comes from dcgmproftester, which is NVIDIA's own SM load generator.
-# A trivial CUDA sample would finish in milliseconds and never register on a
-# 15s scrape, which would make the utilization story unprovable.
+# Load comes from the CUDA nbody sample run in a loop. A single nbody pass
+# finishes well inside one 15s Prometheus scrape, so the loop is what makes
+# the utilization story provable, not the individual run.
+#
+# This used to be dcgmproftester, which is NVIDIA's purpose-built SM load
+# generator and would be the better tool. It cannot be used here: every
+# published dcgm image up to 4.2.3 ships only dcgmproftester12, the binary
+# refuses to run unless its build CUDA version equals the driver's, and the
+# current AL2023 NVIDIA AMI ships a CUDA 13 driver. It exits 253 with
+# "Wrong version of dcgmproftester is used" before doing any work. nbody is
+# CUDA 11.7 and runs anyway, because the driver supports older runtimes,
+# which is exactly the backward compatibility dcgmproftester declines to use.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -29,16 +38,18 @@ spec:
           effect: NoSchedule
       containers:
         - name: burn
-          image: nvcr.io/nvidia/cloud-native/dcgm:3.3.9-1-ubuntu22.04
-          command: ["/usr/bin/dcgmproftester12"]
-          # -t 1004 drives fp16 tensor activity, which is what moves
-          # DCGM_FI_PROF_SM_ACTIVE rather than just DCGM_FI_DEV_GPU_UTIL.
-          args: ["--no-dcgm-validation", "-t", "1004", "-d", "300"]
+          image: nvcr.io/nvidia/k8s/cuda-sample:nbody-cuda11.7.1
+          command: ["/bin/sh", "-c"]
+          # /bin/sh here is dash, which has no $SECONDS, so the deadline is
+          # computed from date(1). nbody keeps the SMs busy for the whole
+          # window, which is what moves DCGM_FI_PROF_SM_ACTIVE rather than
+          # just DCGM_FI_DEV_GPU_UTIL.
+          args:
+            - |
+              end=$(( $(date +%s) + 300 ))
+              while [ "$(date +%s)" -lt "$end" ]; do
+                /cuda-samples/nbody -benchmark -numbodies=262144 -numdevices=1 || exit 1
+              done
           resources:
             limits:
               nvidia.com/gpu: 1
-          securityContext:
-            capabilities:
-              # Profiling counters are privileged. Without SYS_ADMIN the
-              # tester starts and then reports no profiling support.
-              add: ["SYS_ADMIN"]

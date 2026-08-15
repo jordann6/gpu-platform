@@ -30,13 +30,22 @@ variable "vpc_cidr" {
 
 variable "gpu_instance_families" {
   description = <<-EOT
-    Instance families Karpenter may provision for GPU work. g4dn (T4) and g5
-    (A10G) are the only families that make sense at portfolio cost. Neither
-    supports MIG, which is why the MIG profiles in k8s/gpu-operator ship as a
-    documented configuration path rather than a deployed one.
+    Instance families Karpenter may provision for GPU work: g4dn (T4), g5
+    (A10G), g6 (L4) and g6e (L40S). None supports MIG, which is why the MIG
+    profiles in k8s/gpu-operator ship as a documented configuration path
+    rather than a deployed one.
+
+    All four are listed for spot diversity, not because the demo needs four
+    accelerators. The NodePool pins one GPU and a fixed vCPU count, so exactly
+    one size per family qualifies. With only g4dn and g5 that left a single
+    viable instance type once the vCPU pin applied, and provisioning failed
+    outright with "InsufficientInstanceCapacity: There is no Spot capacity
+    available" whenever that one pool was dry. Karpenter asks for at least
+    five instance types when flexible to spot; four is the most this quota
+    and this GPU-count constraint allow.
   EOT
   type        = list(string)
-  default     = ["g4dn", "g5"]
+  default     = ["g4dn", "g5", "g6", "g6e"]
 }
 
 variable "gpu_cpu_limit" {
@@ -106,6 +115,19 @@ variable "reaper_dry_run" {
     When true the reaper logs and records what it would terminate without
     deleting anything. Ships true on purpose: an autonomous terminator of
     expensive hardware that has never been watched in dry-run is a liability.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "create_spot_service_linked_role" {
+  description = <<-EOT
+    Create the EC2 spot service-linked role. It is required before any spot
+    RunInstances call succeeds, and a fresh account does not have it: without
+    it Karpenter silently falls back to on-demand, which quietly voids both
+    the spot savings this project measures and the FIS interruption demo.
+    Set false in an account that already has the role, since it is global and
+    creating it twice fails.
   EOT
   type        = bool
   default     = true

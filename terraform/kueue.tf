@@ -1,5 +1,13 @@
+locals {
+  # Both the namespaces and their LocalQueues iterate this. It has to be a
+  # static local rather than one resource iterating the other: for_each keys
+  # must be known at plan time, and kubernetes_namespace.teams is unknown
+  # until the cluster it lives in has been applied.
+  teams = toset(["team-a", "team-b"])
+}
+
 resource "kubernetes_namespace" "teams" {
-  for_each = toset(["team-a", "team-b"])
+  for_each = local.teams
 
   metadata {
     name = each.key
@@ -67,7 +75,7 @@ resource "kubectl_manifest" "cluster_queue" {
 }
 
 resource "kubectl_manifest" "local_queue" {
-  for_each = kubernetes_namespace.teams
+  for_each = local.teams
 
   yaml_body = yamlencode({
     apiVersion = "kueue.x-k8s.io/v1beta1"
@@ -79,7 +87,9 @@ resource "kubectl_manifest" "local_queue" {
     spec = { clusterQueue = "gpu-queue" }
   })
 
-  depends_on = [kubectl_manifest.cluster_queue]
+  # Iterating local.teams instead of the namespace resource drops the implicit
+  # dependency, so the namespace it is created in has to be named explicitly.
+  depends_on = [kubectl_manifest.cluster_queue, kubernetes_namespace.teams]
 }
 
 resource "kubectl_manifest" "priority_classes" {

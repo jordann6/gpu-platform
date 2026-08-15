@@ -37,6 +37,22 @@ Both are quoted in **vCPUs, not instances**. The GPU NodePool pins
 is two physical cards. The defaults in `terraform/variables.tf` are set for
 that: `gpu_cpu_limit = 8` and `gpu_quota = 2`.
 
+The NodePool also pins `instance-cpu`, and it has to. Both g4dn.xlarge (4 vCPU)
+and g4dn.2xlarge (8 vCPU) carry exactly one card, so without the pin Karpenter
+may take the larger one on price and spend the whole 8 vCPU budget on a single
+GPU while Kueue keeps admitting 2. The second job then pends forever behind
+"all available instance types exceed limits for nodepool". The cost of pinning
+is spot diversity, which is why four families are listed rather than two: with
+only g4dn and g5 the pin leaves a single viable instance type, and provisioning
+fails outright with `InsufficientInstanceCapacity` whenever that one pool is
+dry.
+
+Spot also needs the **`AWSServiceRoleForEC2Spot`** service-linked role, which a
+fresh account does not have. Terraform creates it (`create_spot_service_linked_role`,
+default true; set false where it already exists). Without it Karpenter does not
+error, it silently launches on-demand instead, which voids both the spot
+savings this project measures and the act 5 interruption demo.
+
 8 is the working minimum. 32 is worth requesting for headroom, but the two
 variables above must be raised to match whatever is actually *granted*, not
 what was asked for. A limit above the real quota inverts its purpose: Karpenter
@@ -50,13 +66,25 @@ rather than resolving instantly. File them before anything else.
 
 ```bash
 make venv
-make test        # 34 unit tests, terraform fmt + validate
+make test        # 37 unit tests, terraform fmt + validate, policy gates
 make deploy      # ECR first, then push the image, then everything else
 ```
 
-`make deploy` applies in three stages on purpose. The collector Deployment
-references an image that must already exist, and the image cannot be pushed
-until the ECR repository does, so the repository applies alone first.
+`make deploy` applies in stages on purpose, and the staging is load-bearing:
+
+1. **ECR alone**, because the collector Deployment references an image that
+   must already exist and the image cannot be pushed until the repository does.
+2. **`module.vpc` and `module.eks` together.** The kubernetes, helm and kubectl
+   providers are all configured from `module.eks` outputs, and `alekc/kubectl`
+   validates its config at plan time rather than deferring, so a single-shot
+   apply dies with "no configuration has been provided" before creating
+   anything. `module.vpc` must be targeted alongside it: `-target` pulls in
+   only what the target depends on, and the cluster depends on the VPC and
+   subnets but *not* on the NAT gateway or private route tables. Target the
+   cluster alone and the nodes boot with no egress, never register, and the
+   node group sits in CREATING until it times out with an empty
+   `health.issues` list.
+3. **Everything else**, once the cluster exists and the CRDs are installed.
 
 ## Demo
 
@@ -67,8 +95,8 @@ make demo              # all six acts
 
 | Act | What it proves |
 |---|---|
-| 1 | Karpenter provisions a GPU node from zero in roughly 90 seconds |
-| 2 | Kueue admits 4 of 12 jobs to quota and queues the other 8 |
+| 1 | Karpenter provisions a GPU node from zero, Ready in ~50s, workload running ~40s later |
+| 2 | Kueue admits 2 of 12 jobs to quota (the granted G/VT quota) and queues the rest |
 | 3 | A high-priority job preempts a low-priority one, which requeues rather than dying |
 | 4 | Time-slicing advertises one physical T4 as 4 schedulable GPUs, with cost per job on each |
 | 5 | A real spot interruption drains gracefully and the workload requeues |
@@ -87,6 +115,24 @@ mostly wasted.
 The reaper keys on `DCGM_FI_PROF_SM_ACTIVE` instead, the profiling counter for
 the fraction of SMs with a warp resident. Both are recorded on every sample so
 the gap between them is visible in the data rather than asserted here.
+
+Measured on this cluster, one sample of a `g6e.xlarge` spot node running the
+nbody load:
+
+| GPU_UTIL | SM_ACTIVE | interval cost | of which wasted |
+|---|---|---|---|
+| 100% | 45.82% | $0.031017 | $0.016805 |
+
+The driver gauge calls that card fully utilized. 54% of what it cost bought
+nothing. That is the entire argument for keying on the profiling counter, and
+it is the number this project exists to produce.
+
+`DCGM_FI_PROF_SM_ACTIVE` is **not** in dcgm-exporter's default metric set,
+which ships `GR_ENGINE_ACTIVE`, `DRAM_ACTIVE` and `PIPE_TENSOR_ACTIVE` but not
+SM_ACTIVE. Terraform therefore supplies its own metrics ConfigMap. Without it
+the collector queries a series that does not exist, logs "no GPU samples yet"
+once a minute forever, and writes no cost records at all, with nothing
+anywhere reporting an error.
 
 ### Cost Explorer cannot do this job
 
@@ -108,7 +154,7 @@ time-slicing cannot: time-slicing is cooperative context switching, so every
 replica sees full memory and can OOM its neighbours.
 
 MIG requires A100, H100, H200, B200, or A30 silicon. This project runs on T4
-(g4dn) and A10G (g5), and **neither supports it**. That is not a driver flag or
+(g4dn), A10G (g5), L4 (g6) and L40S (g6e), and **none of them supports it**. That is not a driver flag or
 a licensing tier, the partitioning hardware is absent. The cheapest MIG-capable
 EC2 instance is p4d.24xlarge at roughly $32/hour behind its own quota gate,
 about 100x this project's entire budget.

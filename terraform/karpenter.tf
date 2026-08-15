@@ -146,6 +146,26 @@ resource "kubectl_manifest" "gpu_node_pool" {
               operator = "In"
               values   = ["1"]
             },
+            {
+              # Pin the vCPU size, not just the GPU count. Both g4dn.xlarge
+              # (4 vCPU) and g4dn.2xlarge (8 vCPU) carry exactly one card, and
+              # Karpenter is free to pick the larger one on price. That halves
+              # the GPUs available: the G/VT spot quota and the NodePool cpu
+              # limit are both 8 vCPU, which buys either two xlarge (2 cards)
+              # or one 2xlarge (1 card). Without this, Kueue admits its full
+              # nominalQuota of 2 while the hardware can only ever supply 1,
+              # and the second job pends forever with "all available instance
+              # types exceed limits for nodepool".
+              #
+              # The cost of pinning is diversity: this narrows the pool to the
+              # xlarge of each family, and Karpenter warns that "at least 5
+              # instance types are recommended when flexible to spot". On a
+              # larger G/VT quota the better fix is raising gpu_cpu_limit to a
+              # multiple that admits several sizes, rather than this pin.
+              key      = "karpenter.k8s.aws/instance-cpu"
+              operator = "In"
+              values   = [tostring(var.gpu_cpu_limit / var.gpu_quota)]
+            },
           ]
           expireAfter = var.gpu_node_expire_after
         }
@@ -161,4 +181,13 @@ resource "kubectl_manifest" "gpu_node_pool" {
   })
 
   depends_on = [kubectl_manifest.gpu_node_class]
+}
+
+# Spot capacity is unavailable until this role exists. Karpenter does not
+# report the gap as an error; it just launches on-demand instead, so the
+# failure looks like "spot was expensive today" rather than a missing role.
+resource "aws_iam_service_linked_role" "spot" {
+  count            = var.create_spot_service_linked_role ? 1 : 0
+  aws_service_name = "spot.amazonaws.com"
+  description      = "Lets EC2 fulfil spot requests for Karpenter GPU nodes."
 }

@@ -36,15 +36,20 @@ for i in $(seq 1 "$COUNT"); do
 		          effect: NoSchedule
 		      containers:
 		        - name: burn
-		          image: nvcr.io/nvidia/cloud-native/dcgm:3.3.9-1-ubuntu22.04
-		          command: ["/usr/bin/dcgmproftester12"]
-		          args: ["--no-dcgm-validation", "-t", "1004", "-d", "120"]
+		          # See k8s/workloads/gpu-job.yaml for why this is nbody and not
+		          # dcgmproftester. The \$( ) below are escaped so they survive
+		          # this unquoted heredoc and run in the container, not here.
+		          image: nvcr.io/nvidia/k8s/cuda-sample:nbody-cuda11.7.1
+		          command: ["/bin/sh", "-c"]
+		          args:
+		            - |
+		              end=\$(( \$(date +%s) + 120 ))
+		              while [ "\$(date +%s)" -lt "\$end" ]; do
+		                /cuda-samples/nbody -benchmark -numbodies=262144 -numdevices=1 || exit 1
+		              done
 		          resources:
 		            limits:
 		              nvidia.com/gpu: 1
-		          securityContext:
-		            capabilities:
-		              add: ["SYS_ADMIN"]
 	YAML
 done
 

@@ -39,6 +39,35 @@ resource "kubernetes_config_map" "time_slicing" {
   }
 }
 
+# The stock dcgm-exporter metric list with DCGM_FI_PROF_SM_ACTIVE added. The
+# profiling counters are the ones worth having: DCGM_FI_DEV_GPU_UTIL reports
+# kernel residency, so a single resident kernel using one SM reads as 100%
+# busy. SM_ACTIVE is the fraction of SMs with at least one warp resident,
+# which is what distinguishes a genuinely loaded card from an idle holder.
+resource "kubernetes_config_map" "dcgm_metrics" {
+  metadata {
+    name      = "dcgm-metrics-sm-active"
+    namespace = kubernetes_namespace.gpu_operator.metadata[0].name
+  }
+
+  data = {
+    "dcgm-metrics.csv" = <<-CSV
+      DCGM_FI_PROF_SM_ACTIVE,            gauge, Fraction of SMs with at least one warp resident.
+      DCGM_FI_PROF_GR_ENGINE_ACTIVE,     gauge, Fraction of time the graphics engine was active.
+      DCGM_FI_PROF_PIPE_TENSOR_ACTIVE,   gauge, Fraction of cycles the tensor pipes were active.
+      DCGM_FI_PROF_DRAM_ACTIVE,          gauge, Fraction of cycles device memory was active.
+      DCGM_FI_DEV_GPU_UTIL,              gauge, GPU utilization as reported by the driver.
+      DCGM_FI_DEV_MEM_COPY_UTIL,         gauge, Memory utilization.
+      DCGM_FI_DEV_FB_FREE,               gauge, Framebuffer memory free (MiB).
+      DCGM_FI_DEV_FB_USED,               gauge, Framebuffer memory used (MiB).
+      DCGM_FI_DEV_GPU_TEMP,              gauge, GPU temperature (C).
+      DCGM_FI_DEV_POWER_USAGE,           gauge, Power draw (W).
+      DCGM_FI_DEV_SM_CLOCK,              gauge, SM clock (MHz).
+      DCGM_FI_DEV_XID_ERRORS,            gauge, Last XID error (0 when none).
+    CSV
+  }
+}
+
 resource "helm_release" "gpu_operator" {
   name       = "gpu-operator"
   namespace  = kubernetes_namespace.gpu_operator.metadata[0].name
@@ -75,6 +104,13 @@ resource "helm_release" "gpu_operator" {
         enabled  = true
         interval = "15s"
       }
+      # The stock metric set does NOT include DCGM_FI_PROF_SM_ACTIVE. It ships
+      # GR_ENGINE_ACTIVE, DRAM_ACTIVE and PIPE_TENSOR_ACTIVE, and the whole
+      # FinOps side of this project queries SM_ACTIVE, so with the default
+      # config the collector logs "returned no series" forever, writes no cost
+      # records, and the reaper never makes a decision. Nothing errors: it just
+      # silently measures nothing.
+      config = { name = kubernetes_config_map.dcgm_metrics.metadata[0].name }
     }
 
     # Operator components run on system nodes; only the daemonsets belong on
@@ -136,11 +172,16 @@ resource "helm_release" "prometheus" {
 }
 
 resource "helm_release" "kueue" {
-  name             = "kueue"
-  namespace        = "kueue-system"
-  repository       = "oci://registry.k8s.io/kueue/charts"
-  chart            = "kueue"
-  version          = "0.9.1"
+  name       = "kueue"
+  namespace  = "kueue-system"
+  repository = "oci://registry.k8s.io/kueue/charts"
+  chart      = "kueue"
+  # registry.k8s.io prunes old Kueue chart versions rather than keeping them
+  # forever, so a pin that resolved when this was written can start returning
+  # "not found" with no config change on this side. 0.9.1 died that way; the
+  # oldest still published is 0.11.0. The controllerManager.manager.resources
+  # values schema below is unchanged across this bump.
+  version          = "0.13.0"
   create_namespace = true
   wait             = true
   timeout          = 600

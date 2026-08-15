@@ -53,6 +53,22 @@ deploy: ## Full deploy (ECR, image, then everything else)
 	# be passed here too even though nothing in this stage consumes it.
 	$(TF) apply -input=false -auto-approve -var collector_image_tag=$(TAG) -target=aws_ecr_repository.collector
 	$(MAKE) image
+	# The kubernetes, helm and kubectl providers are all configured from
+	# module.eks outputs. On a fresh apply those outputs are unknown, and
+	# alekc/kubectl validates its configuration at plan time instead of
+	# deferring like the other two, so the whole plan fails with "no
+	# configuration has been provided" before a single resource is created.
+	# The cluster therefore has to exist in state before the manifests are
+	# planned.
+	#
+	# module.vpc must be targeted explicitly alongside it. -target only pulls
+	# in what the targeted resources actually depend on, and the cluster
+	# depends on the VPC and its subnets but NOT on the NAT gateway or the
+	# private route tables. Targeting module.eks alone therefore builds nodes
+	# into subnets with no egress: they boot, never reach ECR or the control
+	# plane, never register, and the node group sits in CREATING until it
+	# times out with an empty health.issues list.
+	$(TF) apply -input=false -auto-approve -var collector_image_tag=$(TAG) -target=module.vpc -target=module.eks
 	$(TF) apply -input=false -auto-approve -var collector_image_tag=$(TAG)
 	$(MAKE) kubeconfig
 
@@ -85,7 +101,33 @@ destroy: ## Tear everything down, GPU nodes first
 	-kubectl delete nodeclaims --all --timeout=10m
 	-kubectl delete pods --all -n team-a --force --grace-period=0
 	-kubectl delete pods --all -n team-b --force --grace-period=0
-	$(TF) destroy -input=false -auto-approve
+	# collector_image_tag is required and has no default, and destroy needs it
+	# just as much as apply does. Without it this target deletes the NodeClaims
+	# and then dies on "No value for required variable", leaving the whole
+	# cluster running and billing while reporting a failed teardown.
+	$(TF) destroy -input=false -auto-approve -var collector_image_tag=$(TAG)
+	@echo "verify nothing survived:"
+	@aws ec2 describe-instances --region $(REGION) \
+		--filters "Name=tag:Project,Values=gpu-platform" "Name=instance-state-name,Values=running,pending" \
+		--query 'Reservations[].Instances[].InstanceId' --output text
+
+# Resume a teardown that died partway, which a leaked VPC-CNI ENI holding the
+# node security group is enough to cause.
+#
+# Plain `make destroy` cannot be re-run once the cluster is gone: the
+# kubernetes, helm and kubectl providers are configured from module.eks
+# outputs, those outputs are UNKNOWN rather than empty when the cluster is no
+# longer in state, and alekc/kubectl rejects that at configure time with "no
+# configuration has been provided". Targeting the two AWS modules configures
+# only the aws provider, so the remaining infrastructure can still be removed.
+#
+# If it stalls on a subnet or security group, look for an ENI left behind by a
+# terminated Karpenter node:
+#   aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=<vpc> \
+#     --query 'NetworkInterfaces[?Status==`available`].NetworkInterfaceId'
+destroy-resume: ## Finish a partially failed teardown (AWS resources only)
+	$(TF) destroy -input=false -auto-approve -var collector_image_tag=$(TAG) \
+		-target=module.eks -target=module.vpc
 	@echo "verify nothing survived:"
 	@aws ec2 describe-instances --region $(REGION) \
 		--filters "Name=tag:Project,Values=gpu-platform" "Name=instance-state-name,Values=running,pending" \

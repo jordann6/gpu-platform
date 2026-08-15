@@ -25,7 +25,7 @@ wait_for() {
 		fi
 		sleep 5
 	done
-	note "${desc} after $(($(date +%s) - start))s"
+	note "got ${desc} after $(($(date +%s) - start))s"
 }
 
 gpu_nodes() {
@@ -42,12 +42,30 @@ act1_provision() {
 	wait_for "a GPU node to join Ready" 300 \
 		"kubectl get nodes -l workload-class=gpu --no-headers 2>/dev/null | grep -q ' Ready '"
 
+	# A Ready node is not the claim being made. The claim is that a GPU
+	# workload runs on it, and those are separable: the node came up Ready and
+	# advertised its card while every job on it exited 253 on a CUDA version
+	# check, and this act still passed because it only ever looked at the node.
+	wait_for "the GPU workload to start running" 300 \
+		"kubectl get pods -n team-a -l job-name=gpu-job --no-headers 2>/dev/null | grep -qE ' (Running|Completed) '"
+
+	if kubectl get pods -n team-a -l job-name=gpu-job --no-headers 2>/dev/null | grep -qE ' (Error|CrashLoopBackOff) '; then
+		echo "FAIL: the GPU job did not run. Logs:" >&2
+		kubectl logs -n team-a -l job-name=gpu-job --tail=20 >&2
+		return 1
+	fi
+	# Printed only now. Before the workload runs, the device plugin has not
+	# finished registering and the GPU column reads <none> on a node that does
+	# in fact have a card.
 	kubectl get nodes -l workload-class=gpu \
 		-o custom-columns=NODE:.metadata.name,TYPE:.metadata.labels.node\\.kubernetes\\.io/instance-type,CAPACITY:.metadata.labels.karpenter\\.sh/capacity-type,GPU:.status.allocatable.nvidia\\.com/gpu
+
+	note "GPU workload is running, so the card is genuinely usable"
 }
 
-# Act 2: quota. Twelve jobs against four GPUs; eight must queue rather than
-# fail or oversubscribe.
+# Act 2: quota. Twelve jobs against the ClusterQueue's nominal GPU quota; the
+# remainder must queue rather than fail or oversubscribe. The quota tracks the
+# granted G/VT service quota, so the admitted count is 2 here, not a constant.
 act2_quota() {
 	banner "Act 2: Kueue admits to quota and queues the rest"
 	./scripts/submit-batch.sh 12
@@ -65,16 +83,42 @@ act2_quota() {
 # evicted work must requeue rather than vanish.
 act3_preemption() {
 	banner "Act 3: high-priority workload preempts and the victim requeues"
+	# Preemption is only observable against a saturated queue. Act 2's cohort
+	# runs for a bounded time, so when this act runs on its own, or after any
+	# delay, those jobs have drained and the high-priority job simply lands in
+	# a free slot and evicts nobody, which still produced an empty eviction
+	# table and a pass. So the queue is refilled here rather than assumed, and
+	# saturation is measured as admitted workloads rather than Running pods:
+	# pods terminating from a previous act still report Running, which read as
+	# saturated within 2s while the new low-priority jobs had not yet started.
+	local quota admitted
+	quota=$(kubectl get clusterqueue gpu-queue \
+		-o jsonpath='{.spec.resourceGroups[0].flavors[0].resources[0].nominalQuota}' 2>/dev/null)
+	admitted=$(kubectl get clusterqueue gpu-queue -o jsonpath='{.status.admittedWorkloads}' 2>/dev/null)
+
+	if ((${admitted:-0} < quota)); then
+		note "only ${admitted:-0} of ${quota} GPU slots admitted; refilling with low-priority work first"
+		./scripts/submit-batch.sh "$((quota * 2))"
+		wait_for "the queue to saturate with low-priority work" 420 \
+			"[ \"\$(kubectl get clusterqueue gpu-queue -o jsonpath='{.status.admittedWorkloads}' 2>/dev/null)\" -ge ${quota} ]"
+	fi
+
 	kubectl apply -f k8s/workloads/priority-job.yaml
 
-	sleep 45
+	# kubectl get events exits 0 with no matches, so the absence of preemption
+	# has to be tested on the output rather than the exit status.
+	# The reason is "Preempted", not "EvictedDueToPreemption". Kueue 0.13
+	# emits Preempted on the Workload (and Stopped on the Job), so the old
+	# filter matched nothing and this act printed an empty table and passed.
+	wait_for "a preemption event naming the high-priority job" 300 \
+		"kubectl get events -A --field-selector reason=Preempted --no-headers 2>/dev/null | grep -q ."
+
 	note "workloads by admission state (Kueue's own printer columns):"
 	kubectl get workloads -A
 
 	note "eviction events, which name the preemptor:"
-	kubectl get events -A --field-selector reason=EvictedDueToPreemption \
-		-o custom-columns=NS:.metadata.namespace,OBJECT:.involvedObject.name,MESSAGE:.message 2>/dev/null ||
-		note "(no preemption events yet)"
+	kubectl get events -A --field-selector reason=Preempted \
+		-o custom-columns=NS:.metadata.namespace,OBJECT:.involvedObject.name,MESSAGE:.message
 
 	note "evicted workloads return to the queue; they are not lost"
 }
@@ -92,8 +136,19 @@ act4_density() {
 	kubectl label node -l workload-class=gpu \
 		nvidia.com/device-plugin.config=shared --overwrite
 
-	wait_for "the device plugin to re-advertise replicas" 240 \
-		"[ \"\$(kubectl get nodes -l workload-class=gpu -o jsonpath='{.items[0].status.allocatable.nvidia\\.com/gpu}')\" != '1' ]"
+	# This must assert an actual increase across every GPU-bearing node, not
+	# "items[0] is not 1". A node that is draining, or whose device plugin has
+	# not registered yet, advertises 0, and 0 != 1 satisfied the old check
+	# instantly: the act passed in 1s and printed an "after" table identical to
+	# the "before" one, having proved nothing. Re-advertising takes ~60s.
+	# This must assert an actual increase, not "items[0] is not 1". A node that
+	# is draining, or whose device plugin has not registered yet, advertises 0,
+	# and 0 != 1 satisfied the old check instantly: the act passed in 1s and
+	# printed an "after" table identical to the "before" one, having proved
+	# nothing. Re-advertising takes ~60s. Any node exceeding 1 is proof the
+	# profile switched; requiring it of every node would hang on a drainer.
+	wait_for "a GPU node to re-advertise more than one replica" 240 \
+		"kubectl get nodes -l workload-class=gpu -o jsonpath='{.items[*].status.allocatable.nvidia\\.com/gpu}' | tr ' ' '\\n' | awk 'NF && \$1 > 1 {found=1} END {exit !found}'"
 
 	note "advertised GPUs per node, shared profile (time-sliced):"
 	kubectl get nodes -l workload-class=gpu \
@@ -130,13 +185,24 @@ act5_spot() {
 		--query 'experiment.id' --output text)
 	note "experiment ${experiment} started"
 
-	note "node condition as Karpenter reacts:"
-	for _ in $(seq 1 12); do
-		kubectl get node "$node" \
-			-o custom-columns=NODE:.metadata.name,SCHEDULABLE:.spec.unschedulable,STATUS:.status.conditions[-1].type \
-			--no-headers 2>/dev/null || break
-		sleep 15
-	done
+	# The claim is a graceful drain, and the evidence for it is Karpenter
+	# cordoning the node with karpenter.sh/disrupted before the instance dies,
+	# not the node eventually going away (a hard kill does that too). A fixed
+	# sampling loop printed "Ready" twelve times and passed, because the notice
+	# arrives minutes after the experiment starts. So wait for the taint, or
+	# for the node object to be removed if the drain completes first.
+	wait_for "Karpenter to cordon the node in response to the notice" 600 \
+		"kubectl get node ${node} -o jsonpath='{.spec.taints[*].key}' 2>/dev/null | grep -q 'karpenter.sh/disrupted' || ! kubectl get node ${node} >/dev/null 2>&1"
+
+	note "node condition after Karpenter reacted:"
+	kubectl get node "$node" \
+		-o custom-columns=NODE:.metadata.name,SCHEDULABLE:.spec.unschedulable,TAINT:.spec.taints[*].key \
+		--no-headers 2>/dev/null || note "node already removed by Karpenter"
+
+	note "the interruption controller's own account of it:"
+	kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=500 2>/dev/null |
+		grep -E '"controller":"interruption"|CordonAndDrain' | tail -3 ||
+		note "(no interruption log lines found)"
 
 	note "workloads should have requeued rather than failed:"
 	kubectl get workloads -A
@@ -152,15 +218,45 @@ act6_reaper() {
 	note "this is invisible to any tool that reports at instance granularity:"
 	note "the instance looks perfectly busy from outside"
 
-	note "collector logs (SM-active versus the utilization gauge that lies):"
-	kubectl -n finops logs -l app=finops-collector --tail=20 || true
+	# The collector querying a metric nobody exports looks exactly like a
+	# startup race: it logs "no GPU samples yet" once a minute and writes
+	# nothing, forever. So wait for a real accounting line before reading
+	# anything else, rather than printing 20 lines of that and calling it a
+	# demo. dcgm-exporter does not ship SM_ACTIVE in its default metric set.
+	wait_for "the collector to actually account for a GPU" 420 \
+		"kubectl -n finops logs -l app=finops-collector --tail=40 2>/dev/null | grep -q 'interval spend'"
 
-	note "reap decisions recorded so far:"
-	aws dynamodb query --region "$REGION" --table-name "$TABLE" \
+	note "collector logs (SM-active versus the utilization gauge that lies):"
+	kubectl -n finops logs -l app=finops-collector --tail=6 || true
+
+	note "cost records written (this is the attribution, per GPU per interval):"
+	aws dynamodb scan --region "$REGION" --table-name "$TABLE" \
+		--filter-expression 'record_type = :t' \
+		--expression-attribute-values '{":t":{"S":"GPU_SAMPLE"}}' \
+		--max-items 3 \
+		--query 'Items[].{node:node.S,type:instance_type.S,life:lifecycle.S,sm_pct:sm_active_pct.N,cost:cost_usd.N,wasted:wasted_cost_usd.N}' \
+		--output table 2>/dev/null || note "(cost table not readable)"
+
+	# A query that matches nothing still exits 0, so the "no reap events" note
+	# on the || branch could never fire and an empty table read as a result.
+	local reaps idle_minutes
+	reaps=$(aws dynamodb query --region "$REGION" --table-name "$TABLE" \
 		--key-condition-expression 'pk = :p' \
 		--expression-attribute-values '{":p":{"S":"REAP"}}' \
 		--query 'Items[].{node:node.S,action:action.S,saving:projected_hourly_saving_usd.N}' \
-		--output table 2>/dev/null || note "(no reap events yet; the idle window has not elapsed)"
+		--output table 2>/dev/null || true)
+
+	note "reap decisions recorded so far:"
+	if [[ -n "$reaps" ]]; then
+		printf '%s\n' "$reaps"
+	else
+		idle_minutes=$(kubectl -n finops get deploy finops-collector \
+			-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="IDLE_MINUTES")].value}' 2>/dev/null)
+		note "none yet, and this is expected rather than a failure: a GPU must"
+		note "stay below the SM-active threshold for ${idle_minutes:-30} minutes"
+		note "before the reaper will act on it, which outlasts this demo. The"
+		note "attribution above is the part that is provable in a short run."
+	fi
 
 	note "to arm it for real: terraform apply -var reaper_dry_run=false"
 }
