@@ -41,12 +41,16 @@ variable "gpu_instance_families" {
 
 variable "gpu_cpu_limit" {
   description = <<-EOT
-    Ceiling on total vCPUs Karpenter may provision for GPU nodes. Held at 32 to
-    match the account service quota for L-DB2E81BA and L-3819A6DF, so a runaway
-    NodePool hits a Terraform-declared wall before it hits an AWS one.
+    Ceiling on total vCPUs Karpenter may provision for GPU nodes. Held at 8 to
+    match the account service quota actually granted for L-DB2E81BA and
+    L-3819A6DF, so a runaway NodePool hits a Terraform-declared wall before it
+    hits an AWS one. Both limits were requested at 32 and granted at 8 with the
+    cases left open; raise this only after confirming the applied quota, because
+    a value above the real quota inverts the point of the variable and Karpenter
+    returns VcpuLimitExceeded instead of a clean unschedulable pod.
   EOT
   type        = number
-  default     = 32
+  default     = 8
 }
 
 variable "gpu_node_expire_after" {
@@ -62,9 +66,21 @@ variable "time_slicing_replicas" {
 }
 
 variable "gpu_quota" {
-  description = "Nominal nvidia.com/gpu quota held by the Kueue ClusterQueue."
+  description = <<-EOT
+    Nominal nvidia.com/gpu quota held by the Kueue ClusterQueue.
+
+    Held at 2, which is what the cluster can actually schedule: the granted
+    G/VT quota is 8 vCPUs and the NodePool pins instance-gpu-count to 1, so
+    8 vCPUs buys 2 physical cards, and the device plugin ships the exclusive
+    "default" profile rather than the time-sliced "shared" one. A nominalQuota
+    above the schedulable count is worse than a low one, because Kueue admits
+    workloads that then sit Pending forever instead of queueing honestly.
+
+    With the "shared" profile applied this can rise to
+    2 x time_slicing_replicas.
+  EOT
   type        = number
-  default     = 4
+  default     = 2
 }
 
 variable "reaper_idle_threshold_pct" {

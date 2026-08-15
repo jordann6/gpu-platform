@@ -32,9 +32,19 @@ L-DB2E81BA   Running On-Demand G and VT instances
 L-3819A6DF   All G and VT Spot Instance Requests
 ```
 
-Both need to be at least 32 for this project. They are separate requests, they
-are per-region, and they go to AWS support rather than resolving instantly.
-File them before anything else.
+Both are quoted in **vCPUs, not instances**. The GPU NodePool pins
+`instance-gpu-count` to 1, so 8 vCPUs buys two g4dn.xlarge or g5.xlarge, which
+is two physical cards. The defaults in `terraform/variables.tf` are set for
+that: `gpu_cpu_limit = 8` and `gpu_quota = 2`.
+
+8 is the working minimum. 32 is worth requesting for headroom, but the two
+variables above must be raised to match whatever is actually *granted*, not
+what was asked for. A limit above the real quota inverts its purpose: Karpenter
+returns `VcpuLimitExceeded` instead of a clean unschedulable pod, and a Kueue
+quota above the schedulable count admits work that then sits Pending forever.
+
+They are separate requests, they are per-region, and they go to AWS support
+rather than resolving instantly. File them before anything else.
 
 ## Deploy
 
