@@ -25,6 +25,13 @@ test: ## Run collector unit tests and terraform validation
 	$(TF) fmt -check -recursive
 	$(TF) validate
 	conftest test --parser hcl2 --combine --policy $(GUARDRAILS)/policy terraform/*.tf
+	@echo "--> policy vacuity check: the non-compliant fixture must be blocked"
+	@if conftest test --parser hcl2 --combine --policy $(GUARDRAILS)/policy \
+		$(GUARDRAILS)/examples/fail/main.tf >/dev/null 2>&1; then \
+		echo "FAIL: the non-compliant fixture passed, so the policy gate above proved nothing."; \
+		exit 1; \
+	fi
+	@echo "OK: non-compliant fixture was blocked."
 	checkov -d terraform --framework terraform --compact --quiet
 
 lint: ## Lint python

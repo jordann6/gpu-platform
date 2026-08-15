@@ -1,4 +1,5 @@
 import pytest
+
 from collector.config import Config
 
 

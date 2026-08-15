@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock
 
 import pytest
+
 from collector.prom import GpuSample, Prometheus, PrometheusError, idle_nodes
 
 
